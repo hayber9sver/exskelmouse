@@ -2,15 +2,15 @@
 //
 // Wiring (board default pins):
 //   OLED    VCC-3V3  GND-GND  SDA-GPIO8  SCL-GPIO9
-//   PMW3360 VI-3V3 (NOT 5V)  GD-GND  SC-GPIO4  MI-GPIO5  MO-GPIO6  SS-GPIO7  MOT-GPIO3  (RS not connected)
+//   PMW3360 VDD-3V3 (module has 2.0 V LDO)  VDDIO-3V3  GND-GND  SCLK-GPIO4  MISO-GPIO5
+//           MOSI-GPIO6  NCS-GPIO7  MOT-GPIO3  NRESET open or 3V3 (internal pull-up)
 //   Buttons left: GPIO1 -> button -> GND   right: GPIO10 -> button -> GND
 //
-// The PMW3360 is detected at boot. Without it the OLED shows "PMW3360: not found"
-// (stage 1 = OLED test). Power off, wire the sensor, power on for stage 2.
+// The PMW3360 is detected at boot. Without it the OLED runs a test screen.
 //
 // Tasks:
-//   loop()   (prio 2) sensor + BLE. Sleeps until MOT fires, reads, sends the report, and
-//                     only when there is new data hands a snapshot to the OLED task.
+//   loop()   (prio 2) sensor + BLE. Sleeps until MOT or a button fires, reads, sends the
+//                     report, and only when there is new data hands a snapshot to the OLED task.
 //   oledTask (prio 1) redraws the OLED from the latest snapshot. Lower priority, so the
 //                     ~25 ms I2C frame transfer never delays the cursor.
 
@@ -35,8 +35,7 @@ constexpr bool INVERT_X = false;
 constexpr bool INVERT_Y = false;
 constexpr bool SWAP_XY  = false;
 
-#define ENABLE_BUTTONS 1             // buttons wired pin -> button -> GND (internal pull-up)
-constexpr int PIN_BTN_LEFT  = 1;
+constexpr int PIN_BTN_LEFT  = 1;     // pin -> button -> GND (internal pull-up)
 constexpr int PIN_BTN_RIGHT = 10;
 
 const char* BLE_NAME = "exskel Mouse";
@@ -63,24 +62,20 @@ struct Snapshot {
 };
 QueueHandle_t oledQueue;
 
-TaskHandle_t sensorTaskHandle = nullptr;  // loopTask; woken by the MOT interrupt
+TaskHandle_t loopHandle;  // loopTask, woken by MOT / button interrupts
 
 // MOT falling edge / button edge -> wake loop()
-void IRAM_ATTR onMotion() {
+void IRAM_ATTR wakeLoop() {
   BaseType_t woken = pdFALSE;
-  if (sensorTaskHandle) vTaskNotifyGiveFromISR(sensorTaskHandle, &woken);
+  vTaskNotifyGiveFromISR(loopHandle, &woken);
   portYIELD_FROM_ISR(woken);
 }
 
 static uint8_t readButtons() {
-#if ENABLE_BUTTONS
   uint8_t b = 0;
   if (digitalRead(PIN_BTN_LEFT) == LOW)  b |= MOUSE_LEFT;
   if (digitalRead(PIN_BTN_RIGHT) == LOW) b |= MOUSE_RIGHT;
   return b;
-#else
-  return 0;
-#endif
 }
 
 void oledTask(void*) {
@@ -112,8 +107,8 @@ void oledTask(void*) {
       lastReports = s.reports;
       lastRate = now;
       if (s.totalX != secX || s.totalY != secY)  // Serial only while moving
-        Serial.printf("BLE:%s PMW:%s dx/s:%ld dy/s:%ld SQUAL:%u surf:%d rep/s:%u\n",
-                      mouse.isConnected() ? "conn" : "adv", sensorOk ? "OK" : "FAIL",
+        Serial.printf("BLE:%s dx/s:%ld dy/s:%ld SQUAL:%u surf:%d rep/s:%u\n",
+                      mouse.isConnected() ? "conn" : "adv",
                       (long)(s.totalX - secX), (long)(s.totalY - secY), s.squal, s.surface, rate);
       secX = s.totalX; secY = s.totalY;
     }
@@ -200,7 +195,7 @@ void setup() {
   }
 
   // --- PMW3360 ---
-  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_PMW_CS);  // library's SPI.begin() then no-ops
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);  // library's own SPI.begin() then no-ops; it drives NCS itself
   sensorOk = sensor.begin(PIN_PMW_CS, PMW_CPI);
   if (sensorOk) {
     // Library leaves Rest mode off (Config2=0x00, wired). 0x20 enables Rest1/2/3 per
@@ -208,7 +203,7 @@ void setup() {
     sensor.writeReg(REG_Config2, 0x20);
     Serial.printf("PMW3360 OK, CPI=%u, Config2=0x%02X\n", sensor.getCPI(), sensor.readReg(REG_Config2));
   } else {
-    uint8_t pid = sensor.readReg(0x00);
+    uint8_t pid = sensor.readReg(REG_Product_ID);
     Serial.printf("PMW3360 not found (Product_ID=0x%02X, expect 0x42; 0x00/0xFF = wiring)\n", pid);
   }
 
@@ -218,18 +213,16 @@ void setup() {
 
   // --- Tasks ---
   oledQueue = xQueueCreate(1, sizeof(Snapshot));
-  sensorTaskHandle = xTaskGetCurrentTaskHandle();  // setup() and loop() run in loopTask
-  vTaskPrioritySet(nullptr, 2);                    // sensor/BLE above the OLED task
+  loopHandle = xTaskGetCurrentTaskHandle();  // setup() and loop() run in loopTask
+  vTaskPrioritySet(nullptr, 2);              // sensor/BLE above the OLED task
   xTaskCreate(oledTask, "oled", 4096, nullptr, 1, nullptr);
 
-  pinMode(PIN_PMW_MOT, INPUT_PULLUP);
-  if (sensorOk) attachInterrupt(digitalPinToInterrupt(PIN_PMW_MOT), onMotion, FALLING);
-#if ENABLE_BUTTONS
+  pinMode(PIN_PMW_MOT, INPUT_PULLUP);  // also keeps MOT high when no sensor is fitted
+  if (sensorOk) attachInterrupt(digitalPinToInterrupt(PIN_PMW_MOT), wakeLoop, FALLING);
   pinMode(PIN_BTN_LEFT, INPUT_PULLUP);
   pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_LEFT), onMotion, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_RIGHT), onMotion, CHANGE);
-#endif
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_LEFT), wakeLoop, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_RIGHT), wakeLoop, CHANGE);
 }
 
 void loop() {
@@ -237,8 +230,8 @@ void loop() {
   static uint8_t lastButtons = 0, rawPrev = 0;
   static uint32_t rawSince = 0;
 
-  // Sleep until MOT or a button edge fires, unless motion is pending (MOT low; also stays
-  // high/pulled-up without a sensor) or a button change is still being debounced.
+  // Sleep until MOT or a button edge fires. Skip the sleep while motion is still pending
+  // (MOT low) or a button change is being debounced.
   bool btnPending = readButtons() != s.buttons;
   if (digitalRead(PIN_PMW_MOT) == HIGH && !btnPending)
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
