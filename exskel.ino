@@ -31,8 +31,8 @@ constexpr int PIN_PMW_CS   = 7;
 constexpr int PIN_PMW_MOT  = 3;      // MOTION, active low: sensor pulls it low when it has moved
 
 constexpr unsigned PMW_CPI = 1600;   // 100..12000, step 100
-constexpr bool INVERT_X = false;
-constexpr bool INVERT_Y = false;
+constexpr bool INVERT_X = true;      // both inverted = sensor mounted rotated 180°
+constexpr bool INVERT_Y = true;
 constexpr bool SWAP_XY  = false;
 
 constexpr int PIN_BTN_LEFT  = 1;     // pin -> button -> GND (internal pull-up)
