@@ -1,5 +1,5 @@
 // Minimal BLE HID mouse on NimBLE-Arduino 2.x
-// Report (ID 1): [buttons(3 bits + 5 pad)] [X int16 LE] [Y int16 LE]
+// Report (ID 1): [buttons(3 bits + 5 pad)] [X int16 LE] [Y int16 LE] [wheel int8]
 #pragma once
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
@@ -34,6 +34,12 @@ static const uint8_t kMouseReportMap[] = {
   0x75, 0x10,        //     Report Size (16)
   0x95, 0x02,        //     Report Count (2)
   0x81, 0x06,        //     Input (Data, Var, Rel)
+  0x09, 0x38,        //     Usage (Wheel)
+  0x15, 0x81,        //     Logical Minimum (-127)
+  0x25, 0x7F,        //     Logical Maximum (127)
+  0x75, 0x08,        //     Report Size (8)
+  0x95, 0x01,        //     Report Count (1)
+  0x81, 0x06,        //     Input (Data, Var, Rel)
   0xC0,              //   End Collection
   0xC0               // End Collection
 };
@@ -66,11 +72,13 @@ class BleHidMouse : public NimBLEServerCallbacks {
 
   bool isConnected() const { return connected_; }
 
-  void send(uint8_t buttons, int16_t dx, int16_t dy) {
+  // wheel > 0 = scroll up
+  void send(uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel) {
     if (!connected_) return;
-    uint8_t r[5] = {buttons,
+    uint8_t r[6] = {buttons,
                     (uint8_t)(dx & 0xFF), (uint8_t)((uint16_t)dx >> 8),
-                    (uint8_t)(dy & 0xFF), (uint8_t)((uint16_t)dy >> 8)};
+                    (uint8_t)(dy & 0xFF), (uint8_t)((uint16_t)dy >> 8),
+                    (uint8_t)wheel};
     input_->setValue(r, sizeof(r));
     input_->notify();
   }

@@ -5,11 +5,13 @@
 //   PMW3360 VDD-3V3 (module has 2.0 V LDO)  VDDIO-3V3  GND-GND  SCLK-GPIO4  MISO-GPIO5
 //           MOSI-GPIO6  NCS-GPIO7  MOT-GPIO3  NRESET open or 3V3 (internal pull-up)
 //   Buttons left: GPIO1 -> button -> GND   right: GPIO10 -> button -> GND
+//           middle: GPIO21 -> button -> GND
+//   Wheel   TTC encoder  A-GPIO0  C (middle pin)-GND  B-GPIO20
 //
 // The PMW3360 is detected at boot. Without it the OLED runs a test screen.
 //
 // Tasks:
-//   loop()   (prio 2) sensor + BLE. Sleeps until MOT or a button fires, reads, sends the
+//   loop()   (prio 2) sensor + BLE. Sleeps until MOT, a button or the wheel fires, reads, sends the
 //                     report, and only when there is new data hands a snapshot to the OLED task.
 //   oledTask (prio 1) redraws the OLED from the latest snapshot. Lower priority, so the
 //                     ~25 ms I2C frame transfer never delays the cursor.
@@ -37,10 +39,17 @@ constexpr bool SWAP_XY  = false;
 
 constexpr int PIN_BTN_LEFT  = 1;     // pin -> button -> GND (internal pull-up)
 constexpr int PIN_BTN_RIGHT = 10;
+constexpr int PIN_BTN_MIDDLE = 21;
+
+constexpr int PIN_WHEEL_A = 0;       // encoder side pins, middle pin to GND (internal pull-ups)
+constexpr int PIN_WHEEL_B = 20;
+constexpr int WHEEL_STEPS_PER_DETENT = 2;  // encoder transitions per click; set to 4 if one click scrolls twice
+constexpr bool INVERT_WHEEL = false;
 
 const char* BLE_NAME = "exskel Mouse";
 constexpr uint32_t MOUSE_PERIOD_MS = 8;    // read rate while moving
-constexpr uint32_t OLED_TIMEOUT_MS = 10000; // OLED sleeps after this long without motion/buttons
+constexpr uint32_t OLED_TIMEOUT_MS = 10000; // OLED sleeps after this long without input
+constexpr bool DEBUG_MODE = false;          // true: OLED never sleeps
 // ----------------------------------------
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -54,7 +63,7 @@ bool sensorOk = false;
 // loop() -> oledTask hand-off. Length-1 queue + xQueueOverwrite = "latest value" mailbox.
 // Totals are running sums, so a skipped snapshot loses no movement.
 struct Snapshot {
-  int32_t  totalX, totalY;
+  int32_t  totalX, totalY, totalWheel;
   uint32_t reports;
   uint8_t  squal;
   bool     surface;
@@ -62,25 +71,39 @@ struct Snapshot {
 };
 QueueHandle_t oledQueue;
 
-TaskHandle_t loopHandle;  // loopTask, woken by MOT / button interrupts
+TaskHandle_t loopHandle;  // loopTask, woken by MOT / button / wheel interrupts
 
-// MOT falling edge / button edge -> wake loop()
+// MOT falling edge / button edge / wheel edge -> wake loop()
 void IRAM_ATTR wakeLoop() {
   BaseType_t woken = pdFALSE;
   vTaskNotifyGiveFromISR(loopHandle, &woken);
   portYIELD_FROM_ISR(woken);
 }
 
+// Quadrature decode on every A/B edge. Invalid jumps (contact bounce) count 0,
+// and a bounce back and forth cancels out (+1 -1).
+volatile int32_t wheelRaw = 0;
+void IRAM_ATTR wheelIsr() {
+  static const int8_t table[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
+  static uint8_t prev = 0;
+  uint32_t in = REG_READ(GPIO_IN_REG);
+  uint8_t ab = (((in >> PIN_WHEEL_A) & 1) << 1) | ((in >> PIN_WHEEL_B) & 1);
+  wheelRaw += table[(prev << 2) | ab];
+  prev = ab;
+  wakeLoop();
+}
+
 static uint8_t readButtons() {
   uint8_t b = 0;
-  if (digitalRead(PIN_BTN_LEFT) == LOW)  b |= MOUSE_LEFT;
-  if (digitalRead(PIN_BTN_RIGHT) == LOW) b |= MOUSE_RIGHT;
+  if (digitalRead(PIN_BTN_LEFT) == LOW)   b |= MOUSE_LEFT;
+  if (digitalRead(PIN_BTN_RIGHT) == LOW)  b |= MOUSE_RIGHT;
+  if (digitalRead(PIN_BTN_MIDDLE) == LOW) b |= MOUSE_MIDDLE;
   return b;
 }
 
 void oledTask(void*) {
   Snapshot s = {};
-  int32_t frameX = 0, frameY = 0, secX = 0, secY = 0;
+  int32_t frameX = 0, frameY = 0, secX = 0, secY = 0, secW = 0;
   uint32_t lastRate = 0, lastReports = 0, rate = 0;
   bool moving = false;
   bool oledOn = true;
@@ -106,17 +129,18 @@ void oledTask(void*) {
       rate = s.reports - lastReports;
       lastReports = s.reports;
       lastRate = now;
-      if (s.totalX != secX || s.totalY != secY)  // Serial only while moving
-        Serial.printf("BLE:%s dx/s:%ld dy/s:%ld SQUAL:%u surf:%d rep/s:%u\n",
+      if (s.totalX != secX || s.totalY != secY || s.totalWheel != secW)  // Serial only while moving
+        Serial.printf("BLE:%s dx/s:%ld dy/s:%ld wheel/s:%ld SQUAL:%u surf:%d rep/s:%u\n",
                       mouse.isConnected() ? "conn" : "adv",
-                      (long)(s.totalX - secX), (long)(s.totalY - secY), s.squal, s.surface, rate);
-      secX = s.totalX; secY = s.totalY;
+                      (long)(s.totalX - secX), (long)(s.totalY - secY), (long)(s.totalWheel - secW),
+                      s.squal, s.surface, rate);
+      secX = s.totalX; secY = s.totalY; secW = s.totalWheel;
     }
 
     if (!oledOk) continue;
 
     // Idle -> panel sleep (0xAE, ~10 uA, RAM kept). Any new data wakes it (0xAF).
-    if (sensorOk && now - lastActivity >= OLED_TIMEOUT_MS) {
+    if (!DEBUG_MODE && sensorOk && now - lastActivity >= OLED_TIMEOUT_MS) {
       if (oledOn) { display.ssd1306_command(SSD1306_DISPLAYOFF); oledOn = false; }
       continue;
     }
@@ -132,9 +156,11 @@ void oledTask(void*) {
       display.printf("PMW3360 OK  CPI %u\n", PMW_CPI);
       display.printf("dx %+6ld  dy %+6ld\n", (long)fdx, (long)fdy);
       display.printf("SQUAL %3u  Surf %s\n", s.squal, s.surface ? "Y" : "N");
-      display.printf("Btn %c%c   rep/s %u\n",
+      display.printf("Btn %c%c%c  rep/s %u\n",
                      (s.buttons & MOUSE_LEFT) ? 'L' : '-',
+                     (s.buttons & MOUSE_MIDDLE) ? 'M' : '-',
                      (s.buttons & MOUSE_RIGHT) ? 'R' : '-', rate);
+      display.printf("Wheel %+6ld\n", (long)s.totalWheel);
     } else {
       display.println("PMW3360: not found");
       display.println("(OLED test mode)");
@@ -221,8 +247,14 @@ void setup() {
   if (sensorOk) attachInterrupt(digitalPinToInterrupt(PIN_PMW_MOT), wakeLoop, FALLING);
   pinMode(PIN_BTN_LEFT, INPUT_PULLUP);
   pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
+  pinMode(PIN_BTN_MIDDLE, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_LEFT), wakeLoop, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_RIGHT), wakeLoop, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_MIDDLE), wakeLoop, CHANGE);
+  pinMode(PIN_WHEEL_A, INPUT_PULLUP);
+  pinMode(PIN_WHEEL_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_A), wheelIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_B), wheelIsr, CHANGE);
 }
 
 void loop() {
@@ -230,7 +262,7 @@ void loop() {
   static uint8_t lastButtons = 0, rawPrev = 0;
   static uint32_t rawSince = 0;
 
-  // Sleep until MOT or a button edge fires. Skip the sleep while motion is still pending
+  // Sleep until an interrupt fires. Skip the sleep while motion is still pending
   // (MOT low) or a button change is being debounced.
   bool btnPending = readButtons() != s.buttons;
   if (digitalRead(PIN_PMW_MOT) == HIGH && !btnPending)
@@ -255,14 +287,22 @@ void loop() {
   if (raw != rawPrev) { rawPrev = raw; rawSince = millis(); }
   else if (millis() - rawSince >= 20) s.buttons = raw;
 
-  if (dx || dy || s.buttons != lastButtons) {
+  // Whole detents since last time; a partial detent stays in wheelRaw for later
+  static int32_t wheelTaken = 0;
+  int32_t detents = (wheelRaw - wheelTaken) / WHEEL_STEPS_PER_DETENT;
+  detents = constrain(detents, -127, 127);
+  wheelTaken += detents * WHEEL_STEPS_PER_DETENT;
+  int8_t wheel = INVERT_WHEEL ? -detents : detents;
+
+  if (dx || dy || wheel || s.buttons != lastButtons) {
     if (mouse.isConnected()) {
-      mouse.send(s.buttons, dx, dy);
+      mouse.send(s.buttons, dx, dy, wheel);
       s.reports++;
     }
     lastButtons = s.buttons;
     s.totalX += dx;
     s.totalY += dy;
+    s.totalWheel += wheel;
     xQueueOverwrite(oledQueue, &s);  // new data only -> OLED task redraws
   }
 
