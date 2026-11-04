@@ -83,19 +83,51 @@ class BleHidMouse : public NimBLEServerCallbacks {
     input_->notify();
   }
 
+  // Host's name, read from its GAP Device Name (0x2A00); shows its address until the reply arrives.
+  // One async ATT "read by type" request: never blocks, the answer lands in onNameRead.
+  const char* peerName() {
+    if (namePending_ && millis() - connectedAt_ >= 1000) {  // let pairing/encryption settle first
+      namePending_ = false;
+      static const ble_uuid16_t kDeviceName = BLE_UUID16_INIT(0x2A00);
+      ble_gattc_read_by_uuid(connHandle_, 1, 0xFFFF, &kDeviceName.u, onNameRead, this);
+    }
+    return peerName_;
+  }
+
   // NimBLEServerCallbacks
   void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
+    connHandle_ = info.getConnHandle();
+    snprintf(peerName_, sizeof(peerName_), "%s", info.getAddress().toString().c_str());
+    connectedAt_ = millis();
+    namePending_ = true;
     connected_ = true;
     // 7.5–15 ms connection interval for smooth cursor movement
-    server->updateConnParams(info.getConnHandle(), 6, 12, 0, 200);
+    server->updateConnParams(connHandle_, 6, 12, 0, 200);
   }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
     connected_ = false;
+    namePending_ = false;
     NimBLEDevice::startAdvertising();
   }
 
  private:
+  static int onNameRead(uint16_t, const ble_gatt_error* err, ble_gatt_attr* attr, void* arg) {
+    if (err->status == 0 && attr) {
+      auto* self = static_cast<BleHidMouse*>(arg);
+      char buf[sizeof(peerName_)] = "";
+      uint16_t n = OS_MBUF_PKTLEN(attr->om);
+      if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+      os_mbuf_copydata(attr->om, 0, n, buf);
+      if (n) memcpy(self->peerName_, buf, sizeof(buf));
+    }
+    return 0;
+  }
+
   NimBLEHIDDevice* hid_ = nullptr;
   NimBLECharacteristic* input_ = nullptr;
   volatile bool connected_ = false;
+  volatile bool namePending_ = false;
+  volatile uint16_t connHandle_ = 0;
+  volatile uint32_t connectedAt_ = 0;
+  char peerName_[32] = "";
 };

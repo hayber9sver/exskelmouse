@@ -1,4 +1,4 @@
-// exskel - Nologo ESP32C3 Super Mini + 0.96" SSD1315 OLED (I2C) + PMW3360 -> BLE mouse
+// exskel - Nologo ESP32C3 Super Mini + 0.91" 128x32 SSD1306 OLED (I2C) + PMW3360 -> BLE mouse
 //
 // Wiring (board default pins):
 //   OLED    VCC-3V3  GND-GND  SDA-GPIO8  SCL-GPIO9
@@ -49,10 +49,10 @@ constexpr bool INVERT_WHEEL = false;
 const char* BLE_NAME = "exskel Mouse";
 constexpr uint32_t MOUSE_PERIOD_MS = 8;    // read rate while moving
 constexpr uint32_t OLED_TIMEOUT_MS = 10000; // OLED sleeps after this long without input
-constexpr bool DEBUG_MODE = false;          // true: OLED never sleeps
+constexpr bool DEBUG_MODE = false;          // true: OLED never sleeps and shows dx/dy, SQUAL, wheel, buttons
 // ----------------------------------------
 
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
+Adafruit_SSD1306 display(128, 32, &Wire, -1);
 PMW3360 sensor;
 BleHidMouse mouse;
 
@@ -146,28 +146,28 @@ void oledTask(void*) {
     }
     if (!oledOn) { display.ssd1306_command(SSD1306_DISPLAYON); oledOn = true; }
 
+    // 128x32 = 4 lines x 21 chars
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.printf("BLE: %s\n", mouse.isConnected() ? "CONNECTED" : "advertising");
-    display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
-    display.setCursor(0, 12);
-    if (sensorOk) {
-      display.printf("PMW3360 OK  CPI %u\n", PMW_CPI);
+    display.printf("BLE %-5s  CPI %u\n", mouse.isConnected() ? "CONN" : "adv", PMW_CPI);
+    if (sensorOk && !DEBUG_MODE) {
+      // host name runs off the right edge (text wrap is off)
+      display.printf("Ch:%s", mouse.isConnected() ? mouse.peerName() : "-");
+    } else if (sensorOk) {
       display.printf("dx %+6ld  dy %+6ld\n", (long)fdx, (long)fdy);
-      display.printf("SQUAL %3u  Surf %s\n", s.squal, s.surface ? "Y" : "N");
-      display.printf("Btn %c%c%c  rep/s %u\n",
+      display.printf("SQ %3u %-3s Wh %+6ld\n", s.squal, s.surface ? "ON" : "OFF", (long)s.totalWheel);
+      display.printf("Btn %c%c%c Ch:%s",
                      (s.buttons & MOUSE_LEFT) ? 'L' : '-',
                      (s.buttons & MOUSE_MIDDLE) ? 'M' : '-',
-                     (s.buttons & MOUSE_RIGHT) ? 'R' : '-', rate);
-      display.printf("Wheel %+6ld\n", (long)s.totalWheel);
+                     (s.buttons & MOUSE_RIGHT) ? 'R' : '-',
+                     mouse.isConnected() ? mouse.peerName() : "-");
     } else {
       display.println("PMW3360: not found");
-      display.println("(OLED test mode)");
       display.printf("uptime %lus\n", now / 1000);
       // moving bar proves the screen is refreshing
       int x = (now / 20) % 118;
-      display.fillRect(x, 50, 10, 6, SSD1306_WHITE);
+      display.fillRect(x, 25, 10, 6, SSD1306_WHITE);
     }
     display.display();
   }
@@ -193,12 +193,12 @@ static void oledSelfTest() {
   delay(200);
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(2);
-  display.setCursor(22, 10);
+  display.setCursor(28, 2);
   display.print("exskel");
   display.setTextSize(1);
-  display.setCursor(22, 36);
+  display.setCursor(31, 21);
   display.printf("OLED @ 0x%02X", oledAddr);
-  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.drawRect(0, 0, 128, 32, SSD1306_WHITE);
   display.display();
   delay(1000);
 }
@@ -214,6 +214,7 @@ void setup() {
   i2cScan();
   if (oledAddr && display.begin(SSD1306_SWITCHCAPVCC, oledAddr)) {
     oledOk = true;
+    display.setTextWrap(false);
     Serial.printf("OLED OK at 0x%02X\n", oledAddr);
     oledSelfTest();
   } else {
