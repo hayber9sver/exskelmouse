@@ -1,8 +1,14 @@
 // Minimal BLE HID mouse on NimBLE-Arduino 2.x
 // Report (ID 1): [buttons(3 bits + 5 pad)] [X int16 LE] [Y int16 LE] [wheel int8]
+//
+// Channels: each channel is a separate BLE identity (own address), so each host bonds
+// to its own channel and only reconnects when that channel is active.
+//   channel 0 = chip's public address (keeps pairings made before channels existed)
+//   channel 1.. = static random address derived from the chip MAC
 #pragma once
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
+#include <esp_mac.h>
 
 #define MOUSE_LEFT   0x01
 #define MOUSE_RIGHT  0x02
@@ -46,8 +52,16 @@ static const uint8_t kMouseReportMap[] = {
 
 class BleHidMouse : public NimBLEServerCallbacks {
  public:
-  void begin(const char* name) {
+  void begin(const char* name, uint8_t channel = 0) {
     NimBLEDevice::init(name);
+    if (channel) {
+      uint8_t a[6];
+      esp_read_mac(a, ESP_MAC_BT);
+      a[0] ^= channel;   // different address per channel
+      a[5] |= 0xC0;      // static random address: top two bits of the MSB (byte 5, little-endian) set
+      ble_hs_id_set_rnd(a);
+      NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+    }
     NimBLEDevice::setSecurityAuth(true, false, true);  // bond, no MITM, secure connections
 
     NimBLEServer* server = NimBLEDevice::createServer();
@@ -72,6 +86,10 @@ class BleHidMouse : public NimBLEServerCallbacks {
 
   bool isConnected() const { return connected_; }
 
+  void disconnect() {
+    if (connected_) NimBLEDevice::getServer()->disconnect(connHandle_);
+  }
+
   // wheel > 0 = scroll up
   void send(uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel) {
     if (!connected_) return;
@@ -93,20 +111,43 @@ class BleHidMouse : public NimBLEServerCallbacks {
     }
     return peerName_;
   }
+  // real name, not the address; only on a bonded link so a host with stale keys isn't remembered
+  bool peerNameReady() const { return connected_ && nameReady_ && bonded_; }
+
+  // Bonded host's identity address, handed out once per (re)connection
+  bool takePeerId(ble_addr_t& out) {
+    if (!idReady_) return false;
+    out = peerId_;
+    idReady_ = false;
+    return true;
+  }
+
+  // Forget a host's bond (keys); drops the link if that host is connected
+  static void unbond(const ble_addr_t& id) { NimBLEDevice::deleteBond(NimBLEAddress(id)); }
 
   // NimBLEServerCallbacks
   void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
     connHandle_ = info.getConnHandle();
     snprintf(peerName_, sizeof(peerName_), "%s", info.getAddress().toString().c_str());
     connectedAt_ = millis();
+    nameReady_ = false;
     namePending_ = true;
+    bonded_ = false;
     connected_ = true;
     // 7.5–15 ms connection interval for smooth cursor movement
     server->updateConnParams(connHandle_, 6, 12, 0, 200);
   }
+  void onAuthenticationComplete(NimBLEConnInfo& info) override {
+    if (!info.isBonded()) return;
+    peerId_ = *info.getIdAddress().getBase();
+    bonded_ = true;
+    idReady_ = true;
+  }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
     connected_ = false;
+    bonded_ = false;
     namePending_ = false;
+    nameReady_ = false;
     NimBLEDevice::startAdvertising();
   }
 
@@ -118,7 +159,7 @@ class BleHidMouse : public NimBLEServerCallbacks {
       uint16_t n = OS_MBUF_PKTLEN(attr->om);
       if (n >= sizeof(buf)) n = sizeof(buf) - 1;
       os_mbuf_copydata(attr->om, 0, n, buf);
-      if (n) memcpy(self->peerName_, buf, sizeof(buf));
+      if (n) { memcpy(self->peerName_, buf, sizeof(buf)); self->nameReady_ = true; }
     }
     return 0;
   }
@@ -127,6 +168,10 @@ class BleHidMouse : public NimBLEServerCallbacks {
   NimBLECharacteristic* input_ = nullptr;
   volatile bool connected_ = false;
   volatile bool namePending_ = false;
+  volatile bool nameReady_ = false;
+  volatile bool bonded_ = false;
+  volatile bool idReady_ = false;
+  ble_addr_t peerId_ = {};
   volatile uint16_t connHandle_ = 0;
   volatile uint32_t connectedAt_ = 0;
   char peerName_[32] = "";

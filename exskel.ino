@@ -6,9 +6,19 @@
 //           MOSI-GPIO6  NCS-GPIO7  MOT-GPIO3  NRESET open or 3V3 (internal pull-up)
 //   Buttons left: GPIO1 -> button -> GND   right: GPIO10 -> button -> GND
 //           middle: GPIO21 -> button -> GND
+//           mode: GPIO2 -> button -> GND  (strapping pin: don't hold it while powering on)
 //   Wheel   TTC encoder  A-GPIO0  C (middle pin)-GND  B-GPIO20
 //
 // The PMW3360 is detected at boot. Without it the OLED runs a test screen.
+//
+// Mode button: normal -> BT channel menu -> CPI menu -> normal (cancel).
+//   In a menu: wheel selects, left confirms, right cancels, 8 s idle cancels.
+//   Menu clicks/scrolls never reach the host; the cursor still moves.
+//   CPI previews live while scrolling; cancel restores it. Confirmed CPI and channel live in NVS.
+//   BT channel: each channel is its own BLE identity, one host per channel. Switching reboots
+//   into the new channel. To pair a new host on a channel, select it and pair from the host.
+//   Hold right 3 s on a highlighted channel: forget its host (bond keys + name). Also remove the
+//   mouse on that host, or it keeps retrying with its old keys.
 //
 // Tasks:
 //   loop()   (prio 2) sensor + BLE. Sleeps until MOT, a button or the wheel fires, reads, sends the
@@ -18,6 +28,7 @@
 
 #include <Wire.h>
 #include <SPI.h>
+#include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <PMW3360.h>
@@ -32,33 +43,50 @@ constexpr int PIN_SPI_MOSI = 6;
 constexpr int PIN_PMW_CS   = 7;
 constexpr int PIN_PMW_MOT  = 3;      // MOTION, active low: sensor pulls it low when it has moved
 
-constexpr unsigned PMW_CPI = 1600;   // 100..12000, step 100
-constexpr bool INVERT_X = true;      // both inverted = sensor mounted rotated 180°
-constexpr bool INVERT_Y = true;
+constexpr uint16_t CPI_PRESETS[] = {400, 800, 1200, 1600, 2400, 3200, 6400};
+constexpr uint8_t CPI_DEFAULT_IDX = 3;  // 1600 until something is saved
+constexpr bool INVERT_X = false;     // both inverted = sensor mounted rotated 180°
+constexpr bool INVERT_Y = false;     // flipped back after final assembly (2026-11-11)
 constexpr bool SWAP_XY  = false;
 
 constexpr int PIN_BTN_LEFT  = 1;     // pin -> button -> GND (internal pull-up)
 constexpr int PIN_BTN_RIGHT = 10;
 constexpr int PIN_BTN_MIDDLE = 21;
+constexpr int PIN_BTN_MODE  = 2;
 
 constexpr int PIN_WHEEL_A = 0;       // encoder side pins, middle pin to GND (internal pull-ups)
 constexpr int PIN_WHEEL_B = 20;
 constexpr int WHEEL_STEPS_PER_DETENT = 2;  // encoder transitions per click; set to 4 if one click scrolls twice
-constexpr bool INVERT_WHEEL = false;
+constexpr bool INVERT_WHEEL = true;
+constexpr uint32_t WHEEL_DEBOUNCE_US = 500;  // A/B state must hold this long to count (bounce ~<1 ms)
 
-const char* BLE_NAME = "exskel Mouse";
+const char* BLE_NAME = "exskel Mouse";     // channel 2/3 advertise as "exskel Mouse 2"/"... 3"
+constexpr uint8_t BLE_CHANNELS = 3;
 constexpr uint32_t MOUSE_PERIOD_MS = 8;    // read rate while moving
 constexpr uint32_t OLED_TIMEOUT_MS = 10000; // OLED sleeps after this long without input
-constexpr bool DEBUG_MODE = false;          // true: OLED never sleeps and shows dx/dy, SQUAL, wheel, buttons
+constexpr uint32_t MENU_TIMEOUT_MS = 8000;  // menu cancels after this long without wheel/button
+constexpr uint32_t CLEAR_HOLD_MS = 3000;    // BT menu: hold right this long to clear the channel
+constexpr bool DEBUG_MODE = false;         // true: OLED never sleeps and shows dx/dy, SQUAL, wheel, buttons
 // ----------------------------------------
+
+constexpr uint8_t CPI_COUNT = sizeof(CPI_PRESETS) / sizeof(CPI_PRESETS[0]);
+constexpr uint8_t BTN_MODE = 0x08;   // internal only, masked off before sending to the host
+enum : uint8_t { MENU_NONE, MENU_BT, MENU_CPI };
 
 Adafruit_SSD1306 display(128, 32, &Wire, -1);
 PMW3360 sensor;
 BleHidMouse mouse;
+Preferences prefs;
 
 bool oledOk = false;
 uint8_t oledAddr = 0;
 bool sensorOk = false;
+
+uint8_t bleChannel = 0;              // active channel, 0-based (shown as 1..3)
+uint8_t cpiIdx = CPI_DEFAULT_IDX;    // confirmed CPI preset
+char chName[BLE_CHANNELS][32] = {};  // last host name seen on each channel ("" = never paired)
+ble_addr_t chAddr[BLE_CHANNELS] = {}; // bonded host's identity address per channel
+bool chHasAddr[BLE_CHANNELS] = {};
 
 // loop() -> oledTask hand-off. Length-1 queue + xQueueOverwrite = "latest value" mailbox.
 // Totals are running sums, so a skipped snapshot loses no movement.
@@ -68,6 +96,9 @@ struct Snapshot {
   uint8_t  squal;
   bool     surface;
   uint8_t  buttons;
+  uint8_t  menu, sel;   // open menu and highlighted item
+  bool     switching;   // BT channel confirmed, about to reboot
+  uint8_t  clearHold;   // BT menu: seconds left of the right-button hold (0 = not holding)
 };
 QueueHandle_t oledQueue;
 
@@ -80,17 +111,86 @@ void IRAM_ATTR wakeLoop() {
   portYIELD_FROM_ISR(woken);
 }
 
-// Quadrature decode on every A/B edge. Invalid jumps (contact bounce) count 0,
-// and a bounce back and forth cancels out (+1 -1).
+// Quadrature decode of debounced A/B states (see wheelAccept).
 volatile int32_t wheelRaw = 0;
-void IRAM_ATTR wheelIsr() {
+
+// WHEEL_TRACE: ISR logs every edge (time, AB, decoded step) to a ring buffer, loop() prints it.
+constexpr bool WHEEL_TRACE = false;
+struct WheelEvt { uint32_t us; uint8_t prev, ab; int8_t d; };
+constexpr uint32_t WTRACE_N = 256;
+WheelEvt wtrace[WTRACE_N];
+volatile uint32_t wtraceHead = 0;
+
+// Debounce: the contacts bounce for up to ~1 ms per step (bursts of edges 2-5 us apart, and the
+// common pin lifting makes A and B jump to 11 together). A state only counts once it has held
+// for WHEEL_DEBOUNCE_US: checked on the next edge (ISR) or by loop() once the wheel goes quiet.
+static uint8_t wheelStable = 0, wheelCand = 0;
+static uint32_t wheelCandUs = 0;
+portMUX_TYPE wheelMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Caller holds wheelMux. Returns the step taken (0 if nothing new is stable yet).
+static int8_t IRAM_ATTR wheelAccept(uint32_t nowUs) {
   static const int8_t table[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
-  static uint8_t prev = 0;
+  if (wheelCand == wheelStable || nowUs - wheelCandUs < WHEEL_DEBOUNCE_US) return 0;
+  int8_t d = table[(wheelStable << 2) | wheelCand];  // a 2-state jump (missed step) counts 0
+  wheelRaw += d;
+  wheelStable = wheelCand;
+  return d;
+}
+
+void IRAM_ATTR wheelIsr() {
   uint32_t in = REG_READ(GPIO_IN_REG);
   uint8_t ab = (((in >> PIN_WHEEL_A) & 1) << 1) | ((in >> PIN_WHEEL_B) & 1);
-  wheelRaw += table[(prev << 2) | ab];
-  prev = ab;
+  uint32_t now = micros();
+  portENTER_CRITICAL_ISR(&wheelMux);
+  uint8_t prev = wheelStable;
+  int8_t d = wheelAccept(now);  // the previous candidate held long enough?
+  wheelCand = ab;
+  wheelCandUs = now;
+  portEXIT_CRITICAL_ISR(&wheelMux);
+  if (WHEEL_TRACE) {
+    uint32_t h = wtraceHead;
+    wtrace[h % WTRACE_N] = {now, prev, ab, d};
+    wtraceHead = h + 1;
+  }
   wakeLoop();
+}
+
+// loop(): accept the final state after the wheel stops. True while a change is still settling.
+static bool wheelSettle() {
+  portENTER_CRITICAL(&wheelMux);
+  wheelAccept(micros());
+  bool pending = wheelCand != wheelStable;
+  portEXIT_CRITICAL(&wheelMux);
+  return pending;
+}
+
+// Print new ISR events and the detents loop() took from them
+static void wheelTraceDump(int32_t detentsSent) {
+  static uint32_t tail = 0;
+  static int32_t lastDir = 0;
+  static uint32_t lastDirMs = 0;
+  uint32_t head = wtraceHead;
+  if (head - tail > WTRACE_N) {
+    Serial.printf("W lost %lu evts\n", (unsigned long)(head - tail - WTRACE_N));
+    tail = head - WTRACE_N;
+  }
+  for (; tail != head; tail++) {
+    WheelEvt e = wtrace[tail % WTRACE_N];
+    static uint32_t lastUs = 0;
+    Serial.printf("W %lu +%lu %u%u>%u%u %+d raw=%ld\n", (unsigned long)e.us,
+                  (unsigned long)(e.us - lastUs), (e.prev >> 1) & 1, e.prev & 1,
+                  (e.ab >> 1) & 1, e.ab & 1, e.d, (long)wheelRaw);
+    lastUs = e.us;
+  }
+  if (detentsSent) {
+    int32_t dir = detentsSent > 0 ? 1 : -1;
+    uint32_t now = millis();
+    bool rev = lastDir && dir != lastDir && now - lastDirMs < 300;
+    Serial.printf("SEND wheel=%+ld%s\n", (long)detentsSent, rev ? "  !!REV" : "");
+    lastDir = dir;
+    lastDirMs = now;
+  }
 }
 
 static uint8_t readButtons() {
@@ -98,7 +198,27 @@ static uint8_t readButtons() {
   if (digitalRead(PIN_BTN_LEFT) == LOW)   b |= MOUSE_LEFT;
   if (digitalRead(PIN_BTN_RIGHT) == LOW)  b |= MOUSE_RIGHT;
   if (digitalRead(PIN_BTN_MIDDLE) == LOW) b |= MOUSE_MIDDLE;
+  if (digitalRead(PIN_BTN_MODE) == LOW)   b |= BTN_MODE;
   return b;
+}
+
+static void nameKey(char* key, uint8_t ch) { key[0] = 'n'; key[1] = '0' + ch; key[2] = 0; }
+static void addrKey(char* key, uint8_t ch) { key[0] = 'a'; key[1] = '0' + ch; key[2] = 0; }
+
+// Forget channel ch's host: delete its bond keys, saved address and name
+static void clearChannel(uint8_t ch) {
+  if (chHasAddr[ch]) BleHidMouse::unbond(chAddr[ch]);
+  if (ch == bleChannel) mouse.disconnect();
+  chHasAddr[ch] = false;
+  chName[ch][0] = 0;
+  char key[3];
+  addrKey(key, ch); prefs.remove(key);
+  nameKey(key, ch); prefs.remove(key);
+  Serial.printf("BT channel %u cleared\n", ch + 1);
+}
+
+static void applyCpi(uint8_t idx) {
+  if (sensorOk) sensor.setCPI(CPI_PRESETS[idx]);
 }
 
 void oledTask(void*) {
@@ -140,7 +260,8 @@ void oledTask(void*) {
     if (!oledOk) continue;
 
     // Idle -> panel sleep (0xAE, ~10 uA, RAM kept). Any new data wakes it (0xAF).
-    if (!DEBUG_MODE && sensorOk && now - lastActivity >= OLED_TIMEOUT_MS) {
+    bool inMenu = s.menu != MENU_NONE || s.switching;
+    if (!DEBUG_MODE && sensorOk && !inMenu && now - lastActivity >= OLED_TIMEOUT_MS) {
       if (oledOn) { display.ssd1306_command(SSD1306_DISPLAYOFF); oledOn = false; }
       continue;
     }
@@ -150,24 +271,42 @@ void oledTask(void*) {
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.printf("BLE %-5s  CPI %u\n", mouse.isConnected() ? "CONN" : "adv", PMW_CPI);
-    if (sensorOk && !DEBUG_MODE) {
-      // host name runs off the right edge (text wrap is off)
-      display.printf("Ch:%s", mouse.isConnected() ? mouse.peerName() : "-");
-    } else if (sensorOk) {
-      display.printf("dx %+6ld  dy %+6ld\n", (long)fdx, (long)fdy);
-      display.printf("SQ %3u %-3s Wh %+6ld\n", s.squal, s.surface ? "ON" : "OFF", (long)s.totalWheel);
-      display.printf("Btn %c%c%c Ch:%s",
-                     (s.buttons & MOUSE_LEFT) ? 'L' : '-',
-                     (s.buttons & MOUSE_MIDDLE) ? 'M' : '-',
-                     (s.buttons & MOUSE_RIGHT) ? 'R' : '-',
-                     mouse.isConnected() ? mouse.peerName() : "-");
+    if (s.switching) {
+      display.printf("Switching to BT %u\n\nreconnecting...", s.sel + 1);
+    } else if (s.menu == MENU_BT) {
+      if (s.clearHold) display.printf("Clear BT%u? hold %u\n", s.sel + 1, s.clearHold);
+      else display.println("BT channel  L:OK R:X");
+      for (uint8_t i = 0; i < BLE_CHANNELS; i++)  // > = highlighted, * = active
+        display.printf("%c%u%c%s\n", i == s.sel ? '>' : ' ', i + 1, i == bleChannel ? '*' : ' ',
+                       chName[i][0] ? chName[i] : "(empty)");
+    } else if (s.menu == MENU_CPI) {
+      display.println("CPI         L:OK R:X");
+      display.setTextSize(2);
+      display.setCursor(16, 13);
+      display.printf("%c %4u %c", s.sel > 0 ? '<' : ' ', CPI_PRESETS[s.sel],
+                     s.sel < CPI_COUNT - 1 ? '>' : ' ');
     } else {
-      display.println("PMW3360: not found");
-      display.printf("uptime %lus\n", now / 1000);
-      // moving bar proves the screen is refreshing
-      int x = (now / 20) % 118;
-      display.fillRect(x, 25, 10, 6, SSD1306_WHITE);
+      display.printf("BT%u %-4s  CPI %u\n", bleChannel + 1, mouse.isConnected() ? "CONN" : "adv",
+                     CPI_PRESETS[cpiIdx]);
+      if (sensorOk && !DEBUG_MODE) {
+        // host name runs off the right edge (text wrap is off)
+        display.printf("Host:%s", mouse.isConnected() ? mouse.peerName() : "-");
+      } else if (sensorOk) {
+        display.printf("dx %+6ld  dy %+6ld\n", (long)fdx, (long)fdy);
+        display.printf("SQ %3u %-3s Wh %+6ld\n", s.squal, s.surface ? "ON" : "OFF", (long)s.totalWheel);
+        display.printf("Btn %c%c%c%c %s",
+                       (s.buttons & MOUSE_LEFT) ? 'L' : '-',
+                       (s.buttons & MOUSE_MIDDLE) ? 'M' : '-',
+                       (s.buttons & MOUSE_RIGHT) ? 'R' : '-',
+                       (s.buttons & BTN_MODE) ? 'D' : '-',
+                       mouse.isConnected() ? mouse.peerName() : "-");
+      } else {
+        display.println("PMW3360: not found");
+        display.printf("uptime %lus\n", now / 1000);
+        // moving bar proves the screen is refreshing
+        int x = (now / 20) % 118;
+        display.fillRect(x, 25, 10, 6, SSD1306_WHITE);
+      }
     }
     display.display();
   }
@@ -204,10 +343,27 @@ static void oledSelfTest() {
 }
 
 void setup() {
+  // A channel switch reboots via ESP.restart(): skip the boot delays so it reconnects fast
+  bool quickBoot = esp_reset_reason() == ESP_RST_SW;
+
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);  // no host reading USB CDC -> drop output instead of blocking ~100 ms per print
-  delay(1500);  // give USB CDC time to enumerate; does not block without a PC
+  if (!quickBoot) delay(1500);  // give USB CDC time to enumerate; does not block without a PC
   Serial.println("\n=== exskel boot ===");
+
+  // --- Saved settings ---
+  prefs.begin("exskel", false);
+  bleChannel = prefs.getUChar("ch", 0);
+  if (bleChannel >= BLE_CHANNELS) bleChannel = 0;
+  cpiIdx = prefs.getUChar("cpi", CPI_DEFAULT_IDX);
+  if (cpiIdx >= CPI_COUNT) cpiIdx = CPI_DEFAULT_IDX;
+  for (uint8_t i = 0; i < BLE_CHANNELS; i++) {
+    char key[3]; nameKey(key, i);
+    if (prefs.isKey(key)) prefs.getString(key, chName[i], sizeof(chName[i]));
+    addrKey(key, i);
+    chHasAddr[i] = prefs.isKey(key) &&
+                   prefs.getBytes(key, &chAddr[i], sizeof(chAddr[i])) == sizeof(chAddr[i]);
+  }
 
   // --- OLED ---
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -215,15 +371,16 @@ void setup() {
   if (oledAddr && display.begin(SSD1306_SWITCHCAPVCC, oledAddr)) {
     oledOk = true;
     display.setTextWrap(false);
+    display.setTextColor(SSD1306_WHITE);
     Serial.printf("OLED OK at 0x%02X\n", oledAddr);
-    oledSelfTest();
+    if (!quickBoot) oledSelfTest();
   } else {
     Serial.println("OLED NOT FOUND - check SDA=GPIO8, SCL=GPIO9, VCC=3V3");
   }
 
   // --- PMW3360 ---
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);  // library's own SPI.begin() then no-ops; it drives NCS itself
-  sensorOk = sensor.begin(PIN_PMW_CS, PMW_CPI);
+  sensorOk = sensor.begin(PIN_PMW_CS, CPI_PRESETS[cpiIdx]);
   if (sensorOk) {
     // Library leaves Rest mode off (Config2=0x00, wired). 0x20 enables Rest1/2/3 per
     // datasheet p.23 (wireless design); MOT still fires on motion from any rest state.
@@ -235,8 +392,11 @@ void setup() {
   }
 
   // --- BLE ---
-  mouse.begin(BLE_NAME);
-  Serial.printf("BLE advertising as \"%s\"\n", BLE_NAME);
+  char name[24];
+  if (bleChannel) snprintf(name, sizeof(name), "%s %u", BLE_NAME, bleChannel + 1);
+  else snprintf(name, sizeof(name), "%s", BLE_NAME);
+  mouse.begin(name, bleChannel);
+  Serial.printf("BLE channel %u advertising as \"%s\"\n", bleChannel + 1, name);
 
   // --- Tasks ---
   oledQueue = xQueueCreate(1, sizeof(Snapshot));
@@ -246,28 +406,44 @@ void setup() {
 
   pinMode(PIN_PMW_MOT, INPUT_PULLUP);  // also keeps MOT high when no sensor is fitted
   if (sensorOk) attachInterrupt(digitalPinToInterrupt(PIN_PMW_MOT), wakeLoop, FALLING);
-  pinMode(PIN_BTN_LEFT, INPUT_PULLUP);
-  pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
-  pinMode(PIN_BTN_MIDDLE, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_LEFT), wakeLoop, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_RIGHT), wakeLoop, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_MIDDLE), wakeLoop, CHANGE);
+  for (int pin : {PIN_BTN_LEFT, PIN_BTN_RIGHT, PIN_BTN_MIDDLE, PIN_BTN_MODE}) {
+    pinMode(pin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(pin), wakeLoop, CHANGE);
+  }
   pinMode(PIN_WHEEL_A, INPUT_PULLUP);
   pinMode(PIN_WHEEL_B, INPUT_PULLUP);
+  delayMicroseconds(50);  // let the pull-ups settle, then start the decoder from the real position
+  wheelStable = wheelCand = (digitalRead(PIN_WHEEL_A) << 1) | digitalRead(PIN_WHEEL_B);
   attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_A), wheelIsr, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_WHEEL_B), wheelIsr, CHANGE);
 }
 
+// Leave the menu. Cancel restores the previewed CPI; confirm saves to NVS.
+static void menuClose(Snapshot& s, bool confirm) {
+  if (s.menu == MENU_CPI) {
+    if (confirm && s.sel != cpiIdx) { cpiIdx = s.sel; prefs.putUChar("cpi", cpiIdx); }
+    applyCpi(cpiIdx);
+  } else if (s.menu == MENU_BT && confirm && s.sel != bleChannel) {
+    prefs.putUChar("ch", s.sel);
+    s.switching = true;  // loop() reboots after the OLED shows it
+  }
+  s.menu = MENU_NONE;
+}
+
 void loop() {
   static Snapshot s = {};
-  static uint8_t lastButtons = 0, rawPrev = 0;
-  static uint32_t rawSince = 0;
+  static uint8_t lastHostButtons = 0, rawPrev = 0, prevButtons = 0;
+  static uint32_t rawSince = 0, menuSince = 0, rightSince = 0;
+  static bool rightArmed = false;  // BT menu: right pressed, release = cancel, hold = clear
+  static bool suppress = false;  // after a menu closes: hold host buttons at 0 until all are released
 
   // Sleep until an interrupt fires. Skip the sleep while motion is still pending
-  // (MOT low) or a button change is being debounced.
+  // (MOT low) or a button change is being debounced. In a menu wake every 100 ms for the timeout.
+  // A wheel state still settling (debounce) needs a timed wake: no further edge may come.
   bool btnPending = readButtons() != s.buttons;
   if (digitalRead(PIN_PMW_MOT) == HIGH && !btnPending)
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ulTaskNotifyTake(pdTRUE, wheelSettle() ? pdMS_TO_TICKS(2)
+                           : s.menu != MENU_NONE ? pdMS_TO_TICKS(100) : portMAX_DELAY);
 
   int16_t dx = 0, dy = 0;
   if (sensorOk) {
@@ -287,24 +463,103 @@ void loop() {
   uint8_t raw = readButtons();
   if (raw != rawPrev) { rawPrev = raw; rawSince = millis(); }
   else if (millis() - rawSince >= 20) s.buttons = raw;
+  uint8_t pressed = s.buttons & ~prevButtons;
+  uint8_t released = prevButtons & ~s.buttons;
+  prevButtons = s.buttons;
 
   // Whole detents since last time; a partial detent stays in wheelRaw for later
   static int32_t wheelTaken = 0;
+  wheelSettle();
   int32_t detents = (wheelRaw - wheelTaken) / WHEEL_STEPS_PER_DETENT;
   detents = constrain(detents, -127, 127);
   wheelTaken += detents * WHEEL_STEPS_PER_DETENT;
-  int8_t wheel = INVERT_WHEEL ? -detents : detents;
+  if (INVERT_WHEEL) detents = -detents;
+  if (WHEEL_TRACE) wheelTraceDump(detents);
 
-  if (dx || dy || wheel || s.buttons != lastButtons) {
+  // ---- Menu ----
+  uint8_t oldMenu = s.menu, oldSel = s.sel, oldHold = s.clearHold;
+  int8_t wheel = 0;
+  if (pressed & BTN_MODE) {  // normal -> BT -> CPI -> normal (cancel)
+    if (s.menu == MENU_NONE)     { s.menu = MENU_BT;  s.sel = bleChannel; }
+    else if (s.menu == MENU_BT)  { s.menu = MENU_CPI; s.sel = cpiIdx; }
+    else                         menuClose(s, false);
+    rightArmed = false;
+  } else if (s.menu != MENU_NONE) {
+    if (detents) {  // wheel up = next item
+      uint8_t count = s.menu == MENU_BT ? BLE_CHANNELS : CPI_COUNT;
+      s.sel = constrain((int32_t)s.sel + detents, 0, count - 1);
+      if (s.menu == MENU_CPI && s.sel != oldSel) applyCpi(s.sel);  // live preview
+      if (s.sel != oldSel) rightArmed = false;  // scrolling away aborts a clear
+    }
+    if (s.menu == MENU_BT && (pressed & MOUSE_RIGHT)) { rightArmed = true; rightSince = millis(); }
+    uint32_t held = millis() - rightSince;
+
+    if (pressed & MOUSE_LEFT) {
+      rightArmed = false;
+      menuClose(s, true);
+    } else if (s.menu == MENU_BT && rightArmed && (released & MOUSE_RIGHT)) {
+      rightArmed = false;  // short press: cancel
+      menuClose(s, false);
+    } else if (s.menu == MENU_BT && rightArmed && held >= CLEAR_HOLD_MS) {
+      rightArmed = false;  // long hold: clear, stay in the menu (release then does nothing)
+      clearChannel(s.sel);
+    } else if (s.menu != MENU_BT && (pressed & MOUSE_RIGHT)) {
+      menuClose(s, false);
+    } else if (!rightArmed && millis() - menuSince >= MENU_TIMEOUT_MS) {
+      menuClose(s, false);
+    }
+    // countdown shown after a brief hold so a quick cancel doesn't flash it
+    s.clearHold = (s.menu == MENU_BT && rightArmed && held >= 300)
+                ? (CLEAR_HOLD_MS - held + 999) / 1000 : 0;
+  } else {
+    wheel = detents;
+  }
+  if (s.menu == MENU_NONE) s.clearHold = 0;
+  bool menuChanged = s.menu != oldMenu || s.sel != oldSel || detents || pressed || released ||
+                     s.clearHold != oldHold;
+  if (s.menu != MENU_NONE && menuChanged) menuSince = millis();
+  if (oldMenu != MENU_NONE && s.menu == MENU_NONE) suppress = true;
+
+  // Host never sees menu clicks: buttons read 0 inside a menu (entering releases any held button)
+  // and stay 0 after it closes until everything is let go.
+  if (suppress && !(s.buttons & (MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE))) suppress = false;
+  uint8_t hostButtons = (s.menu != MENU_NONE || suppress) ? 0
+                      : s.buttons & (MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
+
+  // Remember the bonded host's address (for clearing) and name for this channel's menu entry
+  ble_addr_t id;
+  if (mouse.takePeerId(id) &&
+      (!chHasAddr[bleChannel] || memcmp(&id, &chAddr[bleChannel], sizeof(id)) != 0)) {
+    chAddr[bleChannel] = id;
+    chHasAddr[bleChannel] = true;
+    char key[3]; addrKey(key, bleChannel);
+    prefs.putBytes(key, &id, sizeof(id));
+  }
+  const char* peer = mouse.peerName();
+  if (mouse.peerNameReady() && strcmp(peer, chName[bleChannel]) != 0) {
+    strlcpy(chName[bleChannel], peer, sizeof(chName[bleChannel]));
+    char key[3]; nameKey(key, bleChannel);
+    prefs.putString(key, chName[bleChannel]);
+  }
+
+  if (dx || dy || wheel || hostButtons != lastHostButtons) {
     if (mouse.isConnected()) {
-      mouse.send(s.buttons, dx, dy, wheel);
+      mouse.send(hostButtons, dx, dy, wheel);
       s.reports++;
     }
-    lastButtons = s.buttons;
+    lastHostButtons = hostButtons;
     s.totalX += dx;
     s.totalY += dy;
     s.totalWheel += wheel;
+  }
+  if (dx || dy || wheel || menuChanged || s.switching)
     xQueueOverwrite(oledQueue, &s);  // new data only -> OLED task redraws
+
+  if (s.switching) {  // channel confirmed: let the OLED show it, drop the link, reboot as the new identity
+    vTaskDelay(pdMS_TO_TICKS(600));
+    mouse.disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP.restart();
   }
 
   vTaskDelay(pdMS_TO_TICKS(MOUSE_PERIOD_MS));
