@@ -1,4 +1,4 @@
-// exskel - Nologo ESP32C3 Super Mini + 0.91" 128x32 SSD1306 OLED (I2C) + PMW3360 -> BLE mouse
+﻿// exskel - Nologo ESP32C3 Super Mini + 0.91" 128x32 SSD1306 OLED (I2C) + PMW3360 -> BLE mouse
 //
 // Wiring (board default pins):
 //   OLED    VCC-3V3  GND-GND  SDA-GPIO8  SCL-GPIO9
@@ -19,12 +19,15 @@
 //   into the new channel. To pair a new host on a channel, select it and pair from the host.
 //   Hold right 3 s on a highlighted channel: forget its host (bond keys + name). Also remove the
 //   mouse on that host, or it keeps retrying with its old keys.
+//   Channel lock: once a channel has a host, any other host that connects is dropped and its bond
+//   deleted. Clear the channel (above) to pair a different host.
 //
 // Tasks:
 //   loop()   (prio 2) sensor + BLE. Sleeps until MOT, a button or the wheel fires, reads, sends the
 //                     report, and only when there is new data hands a snapshot to the OLED task.
 //   oledTask (prio 1) redraws the OLED from the latest snapshot. Lower priority, so the
-//                     ~25 ms I2C frame transfer never delays the cursor.
+//                     ~25 ms I2C frame transfer never delays the cursor. A frame is only sent
+//                     when its pixels changed.
 
 #include <Wire.h>
 #include <SPI.h>
@@ -32,6 +35,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <PMW3360.h>
+
+// Serial log (boot info, BLE conn params, once-a-second motion stats)
+constexpr bool SERIAL_LOG = false;
+#define LOGF(...) do { if (SERIAL_LOG) Serial.printf(__VA_ARGS__); } while (0)
+
 #include "ble_hid_mouse.h"
 
 // ---------------- Config ----------------
@@ -62,7 +70,7 @@ constexpr uint32_t WHEEL_DEBOUNCE_US = 500;  // A/B state must hold this long to
 
 const char* BLE_NAME = "exskel Mouse";     // channel 2/3 advertise as "exskel Mouse 2"/"... 3"
 constexpr uint8_t BLE_CHANNELS = 3;
-constexpr uint32_t MOUSE_PERIOD_MS = 8;    // read rate while moving
+constexpr uint32_t MOUSE_PERIOD_MS = 8;    // read rate while moving, until the BLE interval is known
 constexpr uint32_t OLED_TIMEOUT_MS = 10000; // OLED sleeps after this long without input
 constexpr uint32_t MENU_TIMEOUT_MS = 8000;  // menu cancels after this long without wheel/button
 constexpr uint32_t CLEAR_HOLD_MS = 3000;    // BT menu: hold right this long to clear the channel
@@ -114,13 +122,6 @@ void IRAM_ATTR wakeLoop() {
 // Quadrature decode of debounced A/B states (see wheelAccept).
 volatile int32_t wheelRaw = 0;
 
-// WHEEL_TRACE: ISR logs every edge (time, AB, decoded step) to a ring buffer, loop() prints it.
-constexpr bool WHEEL_TRACE = false;
-struct WheelEvt { uint32_t us; uint8_t prev, ab; int8_t d; };
-constexpr uint32_t WTRACE_N = 256;
-WheelEvt wtrace[WTRACE_N];
-volatile uint32_t wtraceHead = 0;
-
 // Debounce: the contacts bounce for up to ~1 ms per step (bursts of edges 2-5 us apart, and the
 // common pin lifting makes A and B jump to 11 together). A state only counts once it has held
 // for WHEEL_DEBOUNCE_US: checked on the next edge (ISR) or by loop() once the wheel goes quiet.
@@ -128,14 +129,12 @@ static uint8_t wheelStable = 0, wheelCand = 0;
 static uint32_t wheelCandUs = 0;
 portMUX_TYPE wheelMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Caller holds wheelMux. Returns the step taken (0 if nothing new is stable yet).
-static int8_t IRAM_ATTR wheelAccept(uint32_t nowUs) {
+// Caller holds wheelMux. Counts the candidate state once it is stable.
+static void IRAM_ATTR wheelAccept(uint32_t nowUs) {
   static const int8_t table[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
-  if (wheelCand == wheelStable || nowUs - wheelCandUs < WHEEL_DEBOUNCE_US) return 0;
-  int8_t d = table[(wheelStable << 2) | wheelCand];  // a 2-state jump (missed step) counts 0
-  wheelRaw += d;
+  if (wheelCand == wheelStable || nowUs - wheelCandUs < WHEEL_DEBOUNCE_US) return;
+  wheelRaw += table[(wheelStable << 2) | wheelCand];  // a 2-state jump (missed step) counts 0
   wheelStable = wheelCand;
-  return d;
 }
 
 void IRAM_ATTR wheelIsr() {
@@ -143,16 +142,10 @@ void IRAM_ATTR wheelIsr() {
   uint8_t ab = (((in >> PIN_WHEEL_A) & 1) << 1) | ((in >> PIN_WHEEL_B) & 1);
   uint32_t now = micros();
   portENTER_CRITICAL_ISR(&wheelMux);
-  uint8_t prev = wheelStable;
-  int8_t d = wheelAccept(now);  // the previous candidate held long enough?
+  wheelAccept(now);  // the previous candidate held long enough?
   wheelCand = ab;
   wheelCandUs = now;
   portEXIT_CRITICAL_ISR(&wheelMux);
-  if (WHEEL_TRACE) {
-    uint32_t h = wtraceHead;
-    wtrace[h % WTRACE_N] = {now, prev, ab, d};
-    wtraceHead = h + 1;
-  }
   wakeLoop();
 }
 
@@ -163,34 +156,6 @@ static bool wheelSettle() {
   bool pending = wheelCand != wheelStable;
   portEXIT_CRITICAL(&wheelMux);
   return pending;
-}
-
-// Print new ISR events and the detents loop() took from them
-static void wheelTraceDump(int32_t detentsSent) {
-  static uint32_t tail = 0;
-  static int32_t lastDir = 0;
-  static uint32_t lastDirMs = 0;
-  uint32_t head = wtraceHead;
-  if (head - tail > WTRACE_N) {
-    Serial.printf("W lost %lu evts\n", (unsigned long)(head - tail - WTRACE_N));
-    tail = head - WTRACE_N;
-  }
-  for (; tail != head; tail++) {
-    WheelEvt e = wtrace[tail % WTRACE_N];
-    static uint32_t lastUs = 0;
-    Serial.printf("W %lu +%lu %u%u>%u%u %+d raw=%ld\n", (unsigned long)e.us,
-                  (unsigned long)(e.us - lastUs), (e.prev >> 1) & 1, e.prev & 1,
-                  (e.ab >> 1) & 1, e.ab & 1, e.d, (long)wheelRaw);
-    lastUs = e.us;
-  }
-  if (detentsSent) {
-    int32_t dir = detentsSent > 0 ? 1 : -1;
-    uint32_t now = millis();
-    bool rev = lastDir && dir != lastDir && now - lastDirMs < 300;
-    Serial.printf("SEND wheel=%+ld%s\n", (long)detentsSent, rev ? "  !!REV" : "");
-    lastDir = dir;
-    lastDirMs = now;
-  }
 }
 
 static uint8_t readButtons() {
@@ -208,13 +173,13 @@ static void addrKey(char* key, uint8_t ch) { key[0] = 'a'; key[1] = '0' + ch; ke
 // Forget channel ch's host: delete its bond keys, saved address and name
 static void clearChannel(uint8_t ch) {
   if (chHasAddr[ch]) BleHidMouse::unbond(chAddr[ch]);
-  if (ch == bleChannel) mouse.disconnect();
+  if (ch == bleChannel) { mouse.setLockedHost(nullptr); mouse.disconnect(); }  // open for a new host
   chHasAddr[ch] = false;
   chName[ch][0] = 0;
   char key[3];
   addrKey(key, ch); prefs.remove(key);
   nameKey(key, ch); prefs.remove(key);
-  Serial.printf("BT channel %u cleared\n", ch + 1);
+  LOGF("BT channel %u cleared\n", ch + 1);
 }
 
 static void applyCpi(uint8_t idx) {
@@ -250,8 +215,9 @@ void oledTask(void*) {
       lastReports = s.reports;
       lastRate = now;
       if (s.totalX != secX || s.totalY != secY || s.totalWheel != secW)  // Serial only while moving
-        Serial.printf("BLE:%s dx/s:%ld dy/s:%ld wheel/s:%ld SQUAL:%u surf:%d rep/s:%u\n",
+        LOGF("BLE:%s itv:%u.%02ums dx/s:%ld dy/s:%ld wheel/s:%ld SQUAL:%u surf:%d rep/s:%u\n",
                       mouse.isConnected() ? "conn" : "adv",
+                      mouse.connInterval() * 125 / 100, mouse.connInterval() * 125 % 100,
                       (long)(s.totalX - secX), (long)(s.totalY - secY), (long)(s.totalWheel - secW),
                       s.squal, s.surface, rate);
       secX = s.totalX; secY = s.totalY; secW = s.totalWheel;
@@ -308,17 +274,14 @@ void oledTask(void*) {
         display.fillRect(x, 25, 10, 6, SSD1306_WHITE);
       }
     }
-    display.display();
-  }
-}
-
-static void i2cScan() {
-  Serial.println("I2C scan:");
-  for (uint8_t a = 1; a < 127; a++) {
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission() == 0) {
-      Serial.printf("  found 0x%02X\n", a);
-      if ((a == 0x3C || a == 0x3D) && !oledAddr) oledAddr = a;
+    // Only push the frame over I2C (~25 ms) when it differs from what the panel shows.
+    // The normal screen doesn't change while the mouse moves, so moving costs no I2C traffic.
+    static uint8_t shown[128 * 32 / 8];
+    static bool shownValid = false;
+    if (!shownValid || memcmp(shown, display.getBuffer(), sizeof(shown)) != 0) {
+      display.display();
+      memcpy(shown, display.getBuffer(), sizeof(shown));
+      shownValid = true;
     }
   }
 }
@@ -348,8 +311,8 @@ void setup() {
 
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);  // no host reading USB CDC -> drop output instead of blocking ~100 ms per print
-  if (!quickBoot) delay(1500);  // give USB CDC time to enumerate; does not block without a PC
-  Serial.println("\n=== exskel boot ===");
+  if (SERIAL_LOG && !quickBoot) delay(1500);  // give USB CDC time to enumerate; does not block without a PC
+  LOGF("\n=== exskel boot ===\n");
 
   // --- Saved settings ---
   prefs.begin("exskel", false);
@@ -367,15 +330,18 @@ void setup() {
 
   // --- OLED ---
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  i2cScan();
-  if (oledAddr && display.begin(SSD1306_SWITCHCAPVCC, oledAddr)) {
+  for (uint8_t a : {0x3C, 0x3D}) {  // the two SSD1306 addresses
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) { oledAddr = a; break; }
+  }
+  if (oledAddr &&display.begin(SSD1306_SWITCHCAPVCC, oledAddr)) {
     oledOk = true;
     display.setTextWrap(false);
     display.setTextColor(SSD1306_WHITE);
-    Serial.printf("OLED OK at 0x%02X\n", oledAddr);
+    LOGF("OLED OK at 0x%02X\n", oledAddr);
     if (!quickBoot) oledSelfTest();
   } else {
-    Serial.println("OLED NOT FOUND - check SDA=GPIO8, SCL=GPIO9, VCC=3V3");
+    LOGF("OLED NOT FOUND - check SDA=GPIO8, SCL=GPIO9, VCC=3V3\n");
   }
 
   // --- PMW3360 ---
@@ -385,18 +351,19 @@ void setup() {
     // Library leaves Rest mode off (Config2=0x00, wired). 0x20 enables Rest1/2/3 per
     // datasheet p.23 (wireless design); MOT still fires on motion from any rest state.
     sensor.writeReg(REG_Config2, 0x20);
-    Serial.printf("PMW3360 OK, CPI=%u, Config2=0x%02X\n", sensor.getCPI(), sensor.readReg(REG_Config2));
+    LOGF("PMW3360 OK, CPI=%u, Config2=0x%02X\n", sensor.getCPI(), sensor.readReg(REG_Config2));
   } else {
     uint8_t pid = sensor.readReg(REG_Product_ID);
-    Serial.printf("PMW3360 not found (Product_ID=0x%02X, expect 0x42; 0x00/0xFF = wiring)\n", pid);
+    LOGF("PMW3360 not found (Product_ID=0x%02X, expect 0x42; 0x00/0xFF = wiring)\n", pid);
   }
 
   // --- BLE ---
   char name[24];
   if (bleChannel) snprintf(name, sizeof(name), "%s %u", BLE_NAME, bleChannel + 1);
   else snprintf(name, sizeof(name), "%s", BLE_NAME);
+  mouse.setLockedHost(chHasAddr[bleChannel] ? &chAddr[bleChannel] : nullptr);  // channel lock
   mouse.begin(name, bleChannel);
-  Serial.printf("BLE channel %u advertising as \"%s\"\n", bleChannel + 1, name);
+  LOGF("BLE channel %u advertising as \"%s\"\n", bleChannel + 1, name);
 
   // --- Tasks ---
   oledQueue = xQueueCreate(1, sizeof(Snapshot));
@@ -443,7 +410,8 @@ void loop() {
   bool btnPending = readButtons() != s.buttons;
   if (digitalRead(PIN_PMW_MOT) == HIGH && !btnPending)
     ulTaskNotifyTake(pdTRUE, wheelSettle() ? pdMS_TO_TICKS(2)
-                           : s.menu != MENU_NONE ? pdMS_TO_TICKS(100) : portMAX_DELAY);
+                           : (s.menu != MENU_NONE || mouse.needsPoll()) ? pdMS_TO_TICKS(100)
+                           : portMAX_DELAY);
 
   int16_t dx = 0, dy = 0;
   if (sensorOk) {
@@ -474,7 +442,6 @@ void loop() {
   detents = constrain(detents, -127, 127);
   wheelTaken += detents * WHEEL_STEPS_PER_DETENT;
   if (INVERT_WHEEL) detents = -detents;
-  if (WHEEL_TRACE) wheelTraceDump(detents);
 
   // ---- Menu ----
   uint8_t oldMenu = s.menu, oldSel = s.sel, oldHold = s.clearHold;
@@ -534,7 +501,9 @@ void loop() {
     chHasAddr[bleChannel] = true;
     char key[3]; addrKey(key, bleChannel);
     prefs.putBytes(key, &id, sizeof(id));
+    mouse.setLockedHost(&chAddr[bleChannel]);  // first host on this channel: lock it
   }
+  if (mouse.needsPoll()) mouse.poll();
   const char* peer = mouse.peerName();
   if (mouse.peerNameReady() && strcmp(peer, chName[bleChannel]) != 0) {
     strlcpy(chName[bleChannel], peer, sizeof(chName[bleChannel]));
@@ -562,5 +531,14 @@ void loop() {
     ESP.restart();
   }
 
-  vTaskDelay(pdMS_TO_TICKS(MOUSE_PERIOD_MS));
+  // Pace reads to the BLE connection interval: one read (the sensor accumulates motion in between)
+  // = one report per connection event, so every event carries the same slice of time.
+  // Sleep most of the gap, then busy-wait the last bit for a precise slot (tick is 1 ms).
+  static uint32_t nextUs = 0;
+  uint32_t periodUs = mouse.connInterval() ? mouse.connInterval() * 1250u : MOUSE_PERIOD_MS * 1000u;
+  if ((int32_t)(micros() - nextUs) > (int32_t)periodUs) nextUs = micros();  // was idle: restart cadence
+  nextUs += periodUs;
+  int32_t leftUs = (int32_t)(nextUs - micros());
+  if (leftUs > 2000) vTaskDelay(pdMS_TO_TICKS((leftUs - 1000) / 1000));
+  while ((int32_t)(micros() - nextUs) < 0) {}
 }

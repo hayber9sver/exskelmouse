@@ -67,24 +67,34 @@ class BleHidMouse : public NimBLEServerCallbacks {
     NimBLEServer* server = NimBLEDevice::createServer();
     server->setCallbacks(this);
 
-    hid_ = new NimBLEHIDDevice(server);
-    input_ = hid_->getInputReport(1);
-    hid_->setManufacturer("exskel");
-    hid_->setPnp(0x02, 0xe502, 0xa111, 0x0210);
-    hid_->setHidInfo(0x00, 0x01);
-    hid_->setReportMap((uint8_t*)kMouseReportMap, sizeof(kMouseReportMap));
-    hid_->startServices();
-    hid_->setBatteryLevel(100);
+    auto* hid = new NimBLEHIDDevice(server);
+    input_ = hid->getInputReport(1);
+    hid->setManufacturer("exskel");
+    hid->setPnp(0x02, 0xe502, 0xa111, 0x0210);
+    hid->setHidInfo(0x00, 0x01);
+    hid->setReportMap((uint8_t*)kMouseReportMap, sizeof(kMouseReportMap));
+    hid->startServices();
+    hid->setBatteryLevel(100);
 
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->setAppearance(0x03C2);  // HID mouse
-    adv->addServiceUUID(hid_->getHidService()->getUUID());
+    adv->addServiceUUID(hid->getHidService()->getUUID());
     adv->setName(name);
     adv->enableScanResponse(true);
     adv->start();
   }
 
-  bool isConnected() const { return connected_; }
+  // Channel lock: only this host (identity address) may use the channel; nullptr = open, any host
+  // may pair. Another host is dropped once its identity is known, and its new bond deleted.
+  void setLockedHost(const ble_addr_t* id) {
+    if (id) lockedId_ = *id;
+    locked_ = id != nullptr;
+  }
+
+  // Connected to a host that may use this channel (reports are only sent then)
+  bool isConnected() const { return connected_ && authorized_; }
+  // Current connection interval in 1.25 ms units (0 = not known)
+  uint16_t connInterval() const { return connected_ ? connItv_ : 0; }
 
   void disconnect() {
     if (connected_) NimBLEDevice::getServer()->disconnect(connHandle_);
@@ -92,7 +102,7 @@ class BleHidMouse : public NimBLEServerCallbacks {
 
   // wheel > 0 = scroll up
   void send(uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel) {
-    if (!connected_) return;
+    if (!isConnected()) return;
     uint8_t r[6] = {buttons,
                     (uint8_t)(dx & 0xFF), (uint8_t)((uint16_t)dx >> 8),
                     (uint8_t)(dy & 0xFF), (uint8_t)((uint16_t)dy >> 8),
@@ -125,6 +135,21 @@ class BleHidMouse : public NimBLEServerCallbacks {
   // Forget a host's bond (keys); drops the link if that host is connected
   static void unbond(const ble_addr_t& id) { NimBLEDevice::deleteBond(NimBLEAddress(id)); }
 
+  // Channel lock housekeeping, call from loop() while needsPoll():
+  // delete a rejected host's bond once it's gone; drop a link that never proved it's the owner.
+  bool needsPoll() const { return rejectPending_ || (connected_ && !authorized_); }
+  void poll() {
+    if (rejectPending_ && !connected_) {
+      rejectPending_ = false;
+      unbond(rejectId_);
+      LOGF("BLE: rejected host's bond deleted\n");
+    }
+    if (connected_ && !authorized_ && millis() - connectedAt_ >= AUTH_TIMEOUT_MS) {
+      LOGF("BLE: host did not authenticate as the channel owner, dropping\n");
+      NimBLEDevice::getServer()->disconnect(connHandle_);
+    }
+  }
+
   // NimBLEServerCallbacks
   void onConnect(NimBLEServer* server, NimBLEConnInfo& info) override {
     connHandle_ = info.getConnHandle();
@@ -133,18 +158,35 @@ class BleHidMouse : public NimBLEServerCallbacks {
     nameReady_ = false;
     namePending_ = true;
     bonded_ = false;
+    authorized_ = !locked_;  // locked channel: wait until encryption reveals who this is
     connected_ = true;
-    // 7.5–15 ms connection interval for smooth cursor movement
-    server->updateConnParams(connHandle_, 6, 12, 0, 200);
+    logConnParams("connect", info);
+    // Ask the host to encrypt now (stored keys, or pairing if new): that reveals its identity
+    // address, which the channel lock checks in onAuthenticationComplete.
+    NimBLEDevice::startSecurity(connHandle_);
+    // Ask for 7.5 ms only: given 7.5–15 Windows picked 15 ms (measured 2026-11-12)
+    server->updateConnParams(connHandle_, 6, 6, 0, 200);
   }
+  // Host accepted (or chose) new connection parameters
+  void onConnParamsUpdate(NimBLEConnInfo& info) override { logConnParams("update", info); }
   void onAuthenticationComplete(NimBLEConnInfo& info) override {
     if (!info.isBonded()) return;
-    peerId_ = *info.getIdAddress().getBase();
+    ble_addr_t id = *info.getIdAddress().getBase();
+    if (locked_ && memcmp(&id, &lockedId_, sizeof(id)) != 0) {  // not this channel's host
+      rejectId_ = id;
+      rejectPending_ = true;  // its fresh bond is deleted in poll() after the link is gone
+      LOGF("BLE: %s is not this channel's host, dropping\n", info.getIdAddress().toString().c_str());
+      NimBLEDevice::getServer()->disconnect(info.getConnHandle());
+      return;
+    }
+    peerId_ = id;
     bonded_ = true;
+    authorized_ = true;
     idReady_ = true;
   }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
     connected_ = false;
+    authorized_ = false;
     bonded_ = false;
     namePending_ = false;
     nameReady_ = false;
@@ -152,6 +194,14 @@ class BleHidMouse : public NimBLEServerCallbacks {
   }
 
  private:
+  // interval unit 1.25 ms, timeout unit 10 ms
+  void logConnParams(const char* what, NimBLEConnInfo& info) {
+    uint16_t itv = info.getConnInterval();
+    connItv_ = itv;
+    LOGF("BLE conn params (%s): interval %u.%02u ms, latency %u, timeout %u ms\n", what,
+                  itv * 125 / 100, itv * 125 % 100, info.getConnLatency(), info.getConnTimeout() * 10);
+  }
+
   static int onNameRead(uint16_t, const ble_gatt_error* err, ble_gatt_attr* attr, void* arg) {
     if (err->status == 0 && attr) {
       auto* self = static_cast<BleHidMouse*>(arg);
@@ -164,9 +214,14 @@ class BleHidMouse : public NimBLEServerCallbacks {
     return 0;
   }
 
-  NimBLEHIDDevice* hid_ = nullptr;
   NimBLECharacteristic* input_ = nullptr;
+  static constexpr uint32_t AUTH_TIMEOUT_MS = 5000;  // locked channel: owner must encrypt by then
   volatile bool connected_ = false;
+  volatile bool authorized_ = false;
+  volatile bool locked_ = false;
+  volatile bool rejectPending_ = false;
+  ble_addr_t lockedId_ = {};
+  ble_addr_t rejectId_ = {};
   volatile bool namePending_ = false;
   volatile bool nameReady_ = false;
   volatile bool bonded_ = false;
@@ -174,5 +229,6 @@ class BleHidMouse : public NimBLEServerCallbacks {
   ble_addr_t peerId_ = {};
   volatile uint16_t connHandle_ = 0;
   volatile uint32_t connectedAt_ = 0;
+  volatile uint16_t connItv_ = 0;
   char peerName_[32] = "";
 };
