@@ -534,11 +534,14 @@ void loop() {
   // Pace reads to the BLE connection interval: one read (the sensor accumulates motion in between)
   // = one report per connection event, so every event carries the same slice of time.
   // Sleep most of the gap, then busy-wait the last bit for a precise slot (tick is 1 ms).
-  static uint32_t nextUs = 0;
-  uint32_t periodUs = mouse.connInterval() ? mouse.connInterval() * 1250u : MOUSE_PERIOD_MS * 1000u;
-  if ((int32_t)(micros() - nextUs) > (int32_t)periodUs) nextUs = micros();  // was idle: restart cadence
+  // 64-bit timer: 32-bit micros() wraps every 71.6 min, and after >35.8 min idle the signed
+  // compare flipped, so loop() slept for up to half an hour and ignored all input.
+  static int64_t nextUs = 0;
+  int64_t periodUs = mouse.connInterval() ? mouse.connInterval() * 1250 : MOUSE_PERIOD_MS * 1000;
+  int64_t nowUs = esp_timer_get_time();
+  if (nowUs - nextUs > periodUs) nextUs = nowUs;  // was idle: restart cadence
   nextUs += periodUs;
-  int32_t leftUs = (int32_t)(nextUs - micros());
+  int64_t leftUs = nextUs - esp_timer_get_time();
   if (leftUs > 2000) vTaskDelay(pdMS_TO_TICKS((leftUs - 1000) / 1000));
-  while ((int32_t)(micros() - nextUs) < 0) {}
+  while (esp_timer_get_time() < nextUs) {}
 }
