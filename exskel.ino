@@ -74,6 +74,7 @@ constexpr uint32_t MOUSE_PERIOD_MS = 8;    // read rate while moving, until the 
 constexpr uint32_t OLED_TIMEOUT_MS = 10000; // OLED sleeps after this long without input
 constexpr uint32_t MENU_TIMEOUT_MS = 8000;  // menu cancels after this long without wheel/button
 constexpr uint32_t CLEAR_HOLD_MS = 3000;    // BT menu: hold right this long to clear the channel
+constexpr uint32_t SLEEP_AFTER_MS = 5 * 60 * 1000;  // no input this long -> deep sleep (wake: move / left click)
 constexpr bool DEBUG_MODE = false;         // true: OLED never sleeps and shows dx/dy, SQUAL, wheel, buttons
 // ----------------------------------------
 
@@ -306,8 +307,10 @@ static void oledSelfTest() {
 }
 
 void setup() {
-  // A channel switch reboots via ESP.restart(): skip the boot delays so it reconnects fast
-  bool quickBoot = esp_reset_reason() == ESP_RST_SW;
+  setCpuFrequencyMhz(80);  // lowest clock BLE allows; plenty for this loop, saves several mA
+
+  // Channel switch (ESP.restart) or deep sleep wake: skip the boot delays so it reconnects fast
+  bool quickBoot = esp_reset_reason() == ESP_RST_SW || esp_reset_reason() == ESP_RST_DEEPSLEEP;
 
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);  // no host reading USB CDC -> drop output instead of blocking ~100 ms per print
@@ -411,7 +414,7 @@ void loop() {
   if (digitalRead(PIN_PMW_MOT) == HIGH && !btnPending)
     ulTaskNotifyTake(pdTRUE, wheelSettle() ? pdMS_TO_TICKS(2)
                            : (s.menu != MENU_NONE || mouse.needsPoll()) ? pdMS_TO_TICKS(100)
-                           : portMAX_DELAY);
+                           : pdMS_TO_TICKS(SLEEP_AFTER_MS));  // timeout = time to check for deep sleep
 
   int16_t dx = 0, dy = 0;
   if (sensorOk) {
@@ -523,6 +526,19 @@ void loop() {
   }
   if (dx || dy || wheel || menuChanged || s.switching)
     xQueueOverwrite(oledQueue, &s);  // new data only -> OLED task redraws
+
+  // Idle too long -> deep sleep. The OLED is already off (OLED_TIMEOUT_MS). Wake = reboot.
+  // Only GPIO0-5 can wake the C3: MOT(3) and left(1). Wheel A(0) may rest low, mode(2) is a strap pin.
+  static uint32_t lastInput = 0;
+  if (dx || dy || detents || raw || s.menu != MENU_NONE) lastInput = millis();
+  else if (!DEBUG_MODE && sensorOk && millis() - lastInput >= SLEEP_AFTER_MS) {
+    mouse.disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    sensor.readBurst();  // clear pending motion so MOT is high
+    esp_deep_sleep_enable_gpio_wakeup((1ULL << PIN_PMW_MOT) | (1ULL << PIN_BTN_LEFT),
+                                      ESP_GPIO_WAKEUP_GPIO_LOW);
+    esp_deep_sleep_start();
+  }
 
   if (s.switching) {  // channel confirmed: let the OLED show it, drop the link, reboot as the new identity
     vTaskDelay(pdMS_TO_TICKS(600));

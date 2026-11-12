@@ -164,8 +164,9 @@ class BleHidMouse : public NimBLEServerCallbacks {
     // Ask the host to encrypt now (stored keys, or pairing if new): that reveals its identity
     // address, which the channel lock checks in onAuthenticationComplete.
     NimBLEDevice::startSecurity(connHandle_);
-    // Ask for 7.5 ms only: given 7.5–15 Windows picked 15 ms (measured 2026-11-12)
-    server->updateConnParams(connHandle_, 6, 6, 0, 200);
+    // Ask for 7.5 ms only: given 7.5–15 Windows picked 15 ms (measured 2026-11-12).
+    // Latency 20: radio may skip up to 20 idle events (saves power); data still goes out next event.
+    server->updateConnParams(connHandle_, 6, 6, 20, 200);
   }
   // Host accepted (or chose) new connection parameters
   void onConnParamsUpdate(NimBLEConnInfo& info) override { logConnParams("update", info); }
