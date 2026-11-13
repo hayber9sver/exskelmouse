@@ -193,7 +193,7 @@ void oledTask(void*) {
   uint32_t lastRate = 0, lastReports = 0, rate = 0;
   bool moving = false;
   bool oledOn = true;
-  uint32_t lastActivity = millis();
+  uint32_t lastActivity = millis(), onSince = lastActivity;  // onSince: start of the 10 s show window
 
   for (;;) {
     // Wait for new data from loop(). On timeout redraw with the last snapshot:
@@ -205,7 +205,10 @@ void oledTask(void*) {
                     : pdMS_TO_TICKS(moving ? 50 : 1000);
     bool fresh = xQueueReceive(oledQueue, &s, wait) == pdTRUE;  // on timeout s keeps the previous value
     uint32_t now = millis();
-    if (fresh) lastActivity = now;
+    if (fresh) {
+      if (now - lastActivity >= OLED_TIMEOUT_MS) onSince = now;  // input after a pause: show again
+      lastActivity = now;
+    }
 
     int32_t fdx = s.totalX - frameX, fdy = s.totalY - frameY;
     frameX = s.totalX; frameY = s.totalY;
@@ -226,9 +229,10 @@ void oledTask(void*) {
 
     if (!oledOk) continue;
 
-    // Idle -> panel sleep (0xAE, ~10 uA, RAM kept). Any new data wakes it (0xAF).
-    bool inMenu = s.menu != MENU_NONE || s.switching;
-    if (!DEBUG_MODE && sensorOk && !inMenu && now - lastActivity >= OLED_TIMEOUT_MS) {
+    // Panel shows for OLED_TIMEOUT_MS after input resumes (or a menu closes), then sleeps
+    // (0xAE, ~10 uA, RAM kept) even while the mouse keeps moving. Mode button opens a menu = shows.
+    if (s.menu != MENU_NONE || s.switching) onSince = now;
+    if (!DEBUG_MODE && sensorOk && now - onSince >= OLED_TIMEOUT_MS) {
       if (oledOn) { display.ssd1306_command(SSD1306_DISPLAYOFF); oledOn = false; }
       continue;
     }
