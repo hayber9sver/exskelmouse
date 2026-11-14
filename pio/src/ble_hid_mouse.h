@@ -14,6 +14,12 @@
 #define MOUSE_RIGHT  0x02
 #define MOUSE_MIDDLE 0x04
 
+// Advertising: fast for FAST_ADV_MS after boot / disconnect (quick reconnect), then slow to save
+// power while no host is around. Interval unit 0.625 ms.
+constexpr uint32_t FAST_ADV_MS = 60000;
+constexpr uint16_t FAST_ADV_MIN = 48, FAST_ADV_MAX = 96;  // 30-60 ms (NimBLE default)
+constexpr uint16_t SLOW_ADV_ITV = 1600;                   // 1 s
+
 static const uint8_t kMouseReportMap[] = {
   0x05, 0x01,        // Usage Page (Generic Desktop)
   0x09, 0x02,        // Usage (Mouse)
@@ -81,7 +87,31 @@ class BleHidMouse : public NimBLEServerCallbacks {
     adv->addServiceUUID(hid->getHidService()->getUUID());
     adv->setName(name);
     adv->enableScanResponse(true);
-    adv->start();
+    // Fast phase timed out -> continue slow, forever (until a host connects)
+    adv->setAdvertisingCompleteCallback([this](NimBLEAdvertising* a) {
+      if (NimBLEDevice::getServer()->getConnectedCount()) return;  // ended by a connection
+      a->setMinInterval(SLOW_ADV_ITV);
+      a->setMaxInterval(SLOW_ADV_ITV);
+      a->start();
+      slowAdv_ = true;
+    });
+    startFastAdv();
+  }
+
+  void startFastAdv() {
+    slowAdv_ = false;
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    adv->setMinInterval(FAST_ADV_MIN);
+    adv->setMaxInterval(FAST_ADV_MAX);
+    adv->start(FAST_ADV_MS);
+  }
+
+  // Mouse touched while no host: back to fast advertising (only from the slow phase).
+  // stop() doesn't fire the complete callback, so this can't race into the slow phase.
+  void wakeAdv() {
+    if (!slowAdv_ || connected_) return;
+    NimBLEDevice::getAdvertising()->stop();
+    startFastAdv();
   }
 
   // Channel lock: only this host (identity address) may use the channel; nullptr = open, any host
@@ -191,7 +221,7 @@ class BleHidMouse : public NimBLEServerCallbacks {
     bonded_ = false;
     namePending_ = false;
     nameReady_ = false;
-    NimBLEDevice::startAdvertising();
+    startFastAdv();
   }
 
  private:
@@ -218,6 +248,7 @@ class BleHidMouse : public NimBLEServerCallbacks {
   NimBLECharacteristic* input_ = nullptr;
   static constexpr uint32_t AUTH_TIMEOUT_MS = 5000;  // locked channel: owner must encrypt by then
   volatile bool connected_ = false;
+  volatile bool slowAdv_ = false;  // advertising in the slow phase (see wakeAdv)
   volatile bool authorized_ = false;
   volatile bool locked_ = false;
   volatile bool rejectPending_ = false;

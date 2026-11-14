@@ -567,6 +567,7 @@ void loop() {
   // Only GPIO0-5 can wake the C3 from deep sleep: MOT(3) and left(1). Wheel A(0) may rest low,
   // mode(2) is a strap pin.
   static uint32_t lastInput = 0;
+  if (dx || dy || detents || raw) mouse.wakeAdv();  // touched while no host: fast advertising again
   if (dx || dy || detents || raw || s.menu != MENU_NONE || mouse.isConnected()) lastInput = millis();
   else if (!DEBUG_MODE && sensorOk && millis() - lastInput >= SLEEP_AFTER_MS) {
     sensor.readBurst();  // clear pending motion so MOT is high
